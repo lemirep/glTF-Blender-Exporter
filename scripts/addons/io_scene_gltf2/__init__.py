@@ -45,10 +45,13 @@ from bpy.props import (CollectionProperty,
                        BoolProperty,
                        EnumProperty,
                        FloatProperty,
-                       IntProperty)
+                       IntProperty,
+                       PointerProperty)
 
 
 from bpy_extras.io_utils import (ExportHelper)
+
+from . import extension_exporters
 
 #
 # Globals
@@ -83,6 +86,15 @@ Toggle off to clear settings"""
             # clear settings
             del context.scene[operator.scene_key]
         return {"FINISHED"}
+
+
+class ExtPropertyGroup(bpy.types.PropertyGroup):
+    name = StringProperty(name='Extension Name')
+    enable = BoolProperty(
+        name='Enable',
+        description='Enable this extension',
+        default=False
+    )
 
 class ExportGLTF2_Base():
     export_copyright = StringProperty(
@@ -277,6 +289,39 @@ class ExportGLTF2_Base():
 
     will_save_settings = BoolProperty(default=False)
 
+    # Entries for extensions
+    ext_exporters = sorted(
+        [exporter() for exporter in extension_exporters.__all__],
+        key=lambda ext: ext.ext_meta['name']
+    )
+    export_extensions = CollectionProperty(
+        name='Extensions',
+        type=ExtPropertyGroup,
+        description='Select extensions to enable'
+    )
+    ext_prop_to_exporter_map = {}
+    for ext_exporter in ext_exporters:
+        meta = ext_exporter.ext_meta
+        if 'settings' in meta:
+            name = 'settings_' + meta['name']
+            prop_group = type(name, (bpy.types.PropertyGroup,), meta['settings'])
+            bpy.utils.register_class(prop_group)
+            value = PointerProperty(type=prop_group)
+            locals()[name] = value
+
+    def update_extensions(self):
+        self.ext_prop_to_exporter_map = {ext.ext_meta['name']: ext for ext in self.ext_exporters}
+
+        for prop in self.export_extensions:
+            exporter = self.ext_prop_to_exporter_map[prop.name]
+            exporter.ext_meta['enable'] = prop.enable
+
+        self.export_extensions.clear()
+        for exporter in self.ext_exporters:
+            prop = self.export_extensions.add()
+            prop.name = exporter.ext_meta['name']
+            prop.enable = exporter.ext_meta['enable']
+
     # Custom scene property for saving settings
     scene_key = "glTF2ExportSettings"
 
@@ -284,6 +329,7 @@ class ExportGLTF2_Base():
 
     def invoke(self, context, event):
         settings = context.scene.get(self.scene_key)
+        self.update_extensions()
         self.will_save_settings = False
         if settings:
             try:
@@ -307,6 +353,10 @@ class ExportGLTF2_Base():
         context.scene[self.scene_key] = export_props
 
     def execute(self, context):
+        # Ensure we have built the extension name map
+        # this is needed when blender is used in background mode (tests)
+        self.update_extensions()
+
         from . import gltf2_export
 
         if self.will_save_settings:
@@ -373,9 +423,20 @@ class ExportGLTF2_Base():
         export_settings['gltf_binary'] = bytearray()
         export_settings['gltf_binaryfilename'] = os.path.splitext(os.path.basename(self.filepath))[0] + '.bin'
 
+        export_settings['gltf_extensions'] = [
+            {
+                 # Add extension and settings if set
+                 'extension': self.ext_prop_to_exporter_map[prop.name],
+                 'settings': getattr(self, 'settings_' + prop.name, None)
+            } for prop in self.export_extensions if prop.enable
+        ]
+
         return gltf2_export.save(self, context, export_settings)
 
     def draw(self, context):
+        # Ensure we have built the extension name map
+        self.update_extensions()
+
         layout = self.layout
 
         #
@@ -444,6 +505,44 @@ class ExportGLTF2_Base():
             col.label('Experimental:', icon='RADIO')
             col.prop(self, 'export_lights')
             col.prop(self, 'export_displacement')
+
+        # Extensions
+        col = layout.box().column()
+        col.label('Extensions:', icon='PLUGIN')
+        extension_filter = set()
+        for i in range(len(self.export_extensions)):
+            prop = self.export_extensions[i]
+            extension_exporter = self.ext_prop_to_exporter_map[prop.name]
+
+            # If we happen to have twice the same extension, skip
+            if extension_exporter.ext_meta['name'] in extension_filter:
+                continue
+
+            row = col.row()
+            row.prop(prop, 'enable', text=prop.name)
+            if extension_exporter.ext_meta.get('isDraft', False):
+                row.prop(self, 'draft_prop', icon='ERROR', emboss=False)
+            info_op = row.operator('wm.url_open', icon='INFO', emboss=False)
+            info_op.url = extension_exporter.ext_meta.get('url', '')
+
+            if prop.enable:
+                settings = getattr(self, 'settings_' + prop.name, None)
+                if settings:
+                    box = col.box()
+                    if hasattr(extension_exporter, 'draw_settings'):
+                        extension_exporter.draw_settings(box, settings, context)
+                    else:
+                        setting_props = [
+                            name for name in dir(settings)
+                            if not name.startswith('_')
+                            and name not in ('bl_rna', 'name', 'rna_type')
+                        ]
+                        for setting_prop in setting_props:
+                            box.prop(settings, setting_prop)
+                    # Add a bit of space before moving to next property
+                    if i < len(self.export_extensions) - 1:
+                        col.separator()
+                        col.separator()
 
         row = layout.row()
         row.operator(
